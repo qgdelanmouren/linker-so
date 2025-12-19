@@ -1,15 +1,15 @@
 [target.aarch64-linux-android]
-ar = "/home/xhc/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-linker = "/home/xhc/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+ar = "D:/IDE/Android/SDK/ndk/29.0.13846066/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+linker = "D:/IDE/Android/SDK/ndk/29.0.13846066/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
 
 [target.armv7-linux-androideabi]
-ar = "/home/xhc/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-linker = "/home/xhc/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi30-clang"
+ar = "D:/IDE/Android/SDK/ndk/29.0.13846066/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+linker = "D:/IDE/Android/SDK/ndk/29.0.13846066/toolchains/llvm/prebuilt/windows-x86_64/bin/armv7a-linux-androideabi30-clang.cmd"
 
 [target.x86_64-linux-android]
-ar = "/home/xhc/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-linker = "/home/xhc/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android30-clang"
+ar = "D:/IDE/Android/SDK/ndk/29.0.13846066/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+linker = "D:/IDE/Android/SDK/ndk/29.0.13846066/toolchains/llvm/prebuilt/windows-x86_64/bin/x86_64-linux-android30-clang.cmd"
 
 [target.i686-linux-android]
-ar = "/home/xhc/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-linker = "/home/xhc/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android30-clang"
+ar = "D:/IDE/Android/SDK/ndk/29.0.13846066/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+linker = "D:/IDE/Android/SDK/ndk/29.0.13846066/toolchains/llvm/prebuilt/windows-x86_64/bin/i686-linux-android30-clang.cmd"

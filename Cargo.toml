@@ -3,8 +3,30 @@ name = "linker"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
+indexmap = "2.12.1"
 libc = "0.2"
+log = "0.4"
+chacha20poly1305 = "0.10"
+zeroize = "1.7"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.13"
 
 [build-dependencies]
 cc = "1.0"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+
+[features]
+jni_onload_all = []
+
+[profile.release]
+strip = true      # Automatically strip symbols from the binary.
+opt-level = "z"   # Optimize for size.
+lto = true        # Enable Link Time Optimization.
+codegen-units = 1 # Reduce parallel code generation units to increase optimization.
+#panic = "abort"   # Abort on panic instead of unwinding, which saves significant space.

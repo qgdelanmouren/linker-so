@@ -3,6 +3,7 @@ use libc::{
     mprotect,
 };
 
+#[cfg(not(target_arch = "arm"))]
  unsafe extern "C" {
     unsafe fn __register_frame(begin: *const u8);
     unsafe fn __deregister_frame(begin: *const u8);
@@ -18,6 +19,7 @@ use std::slice;
 
 use crate::context::LinkerContext;
 use crate::elf::*;
+use crate::tls;
 use crate::utils::{get_page_size, page_end, page_start};
 use crate::xdl;
 
@@ -79,6 +81,10 @@ pub struct ElfLoader {
     fallback_resolvers: Vec<Rc<RefCell<ElfLoader>>>,
     
     eh_frame_addr: *const u8,
+    
+    // TLS support
+    tls_module_id: usize,
+    tlsdesc_args: Vec<Box<[usize; 2]>>,
 }
 
 impl ElfLoader {
@@ -121,6 +127,8 @@ impl ElfLoader {
             ifunc_relocations: Vec::new(),
             fallback_resolvers: Vec::new(),
             eh_frame_addr: ptr::null(),
+            tls_module_id: 0,
+            tlsdesc_args: Vec::new(),
         }
     }
 
@@ -172,11 +180,72 @@ impl ElfLoader {
 
         self.reserve_address_space()?;
         self.map_segments(&mut source, page_size)?;
+        self.process_tls_segment();
         self.register_eh_frame();
         self.find_dynamic_section()?;
         println!("[Loader] Mapped & Parsed. SymCount: {}", self.sym_count);
 
         Ok(())
+    }
+
+    fn process_tls_segment(&mut self) {
+        for ph in &self.phdrs {
+            if ph.p_type == PT_TLS {
+                let image_ptr = (self.load_bias + ph.p_vaddr as usize) as *const u8;
+                let image_size = ph.p_filesz as usize;
+                let mem_size = ph.p_memsz as usize;
+                let align = ph.p_align as usize;
+                
+                // Register TLS module
+                self.tls_module_id = tls::register_tls_module(image_ptr, image_size, mem_size, align);
+                println!("[Loader] Registered TLS module id={} size={}/{} align={}", 
+                         self.tls_module_id, image_size, mem_size, align);
+                break;
+            }
+        }
+    }
+
+    pub fn get_export_tls_symbol(&self, name: &str) -> Option<usize> {
+        if self.symtab.is_null() || self.strtab.is_null() {
+            return None;
+        }
+
+        let count = if self.sym_count > 0 {
+            self.sym_count
+        } else {
+            30000
+        };
+
+        for i in 0..count {
+            unsafe {
+                let sym_ptr = self.symtab.add(i);
+                if !self.is_valid_ptr(sym_ptr as usize) {
+                    break;
+                }
+
+                let sym = &*sym_ptr;
+                if sym.st_name == 0 {
+                    continue;
+                }
+                
+                // Check if it's a TLS symbol
+                if (sym.st_info & 0xf) != STT_TLS {
+                    continue;
+                }
+
+                if let Some(s) = self.get_safe_string(sym.st_name as usize) {
+                    if s == name {
+                        // Return the offset (st_value)
+                        return Some(sym.st_value as usize);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_tls_module_id(&self) -> usize {
+        self.tls_module_id
     }
 
     fn get_safe_string(&self, offset: usize) -> Option<String> {
@@ -435,121 +504,196 @@ impl ElfLoader {
         ctx: &Rc<RefCell<LinkerContext>>,
     ) -> Result<bool, String> {
         match r_type {
+            // =========================================================
+            // AArch64 Relocations
+            // =========================================================
+            #[cfg(target_arch = "aarch64")]
             R_AARCH64_NONE => Ok(true),
             
+            #[cfg(target_arch = "aarch64")]
             R_AARCH64_RELATIVE => {
                 let val = (self.load_bias as i64 + addend) as usize;
-                unsafe {
-                    *reloc_addr = val;
-                }
+                unsafe { *reloc_addr = val; }
                 Ok(true)
             }
             
+            #[cfg(target_arch = "aarch64")]
             R_AARCH64_IRELATIVE => {
-                // IFUNC: resolver function address = load_bias + addend
                 let resolver_addr = (self.load_bias as i64 + addend) as usize;
-                // Defer IFUNC resolution until all other relocations are done
                 self.ifunc_relocations.push((reloc_addr as usize, resolver_addr));
                 Ok(true)
             }
             
+            #[cfg(target_arch = "aarch64")]
             R_AARCH64_COPY => {
-                // R_AARCH64_COPY: copy symbol data from shared library
-                if let Some(name) = self.get_sym_name(r_sym) {
-                    if let Some(sym_addr) = self.resolve_symbol_for_reloc(&name, ctx) {
-                        // Get the symbol size
-                        let sym_size = self.get_sym_size(r_sym).unwrap_or(0);
-                        if sym_size > 0 && self.is_valid_ptr(sym_addr) {
-                            unsafe {
-                                ptr::copy_nonoverlapping(
-                                    sym_addr as *const u8,
-                                    reloc_addr as *mut u8,
-                                    sym_size,
-                                );
-                            }
-                        }
-                        return Ok(true);
-                    }
-                }
+                self.process_copy_reloc(r_sym, reloc_addr, ctx)
+            }
+            
+            #[cfg(target_arch = "aarch64")]
+            R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT | R_AARCH64_ABS64 => {
+                self.process_global_reloc(r_sym, reloc_addr, addend, ctx, "AArch64")
+            }
+            
+            #[cfg(target_arch = "aarch64")]
+            R_AARCH64_TLS_DTPMOD64 => {
+                self.process_tls_dtpmod(r_sym, reloc_addr, ctx)
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            R_AARCH64_TLS_DTPREL64 => {
+                self.process_tls_dtprel(r_sym, reloc_addr, addend, ctx)
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            R_AARCH64_TLS_TPREL64 => {
+                println!("[Reloc] Error: R_AARCH64_TLS_TPREL64 (Static TLS) not supported!");
                 Ok(false)
             }
-            
-            R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT | R_AARCH64_ABS64 => {
-                if r_sym == 0 {
-                    // No symbol, use addend only
-                    let val = (self.load_bias as i64 + addend) as usize;
-                    unsafe {
-                        *reloc_addr = val;
-                    }
-                    return Ok(true);
-                }
-                
-                if let Some(name) = self.get_sym_name(r_sym) {
-                    // Debug: print all string-related symbols
-                    let is_str_func = name.contains("str") || name.contains("mem") || name.contains("cmp");
-                    if is_str_func {
-                        println!("[Reloc] String/Mem func: {} at GOT 0x{:x} (load_bias=0x{:x})", 
-                                 name, reloc_addr as usize, self.load_bias);
-                        unsafe {
-                            let before_val = ptr::read(reloc_addr);
-                            println!("[Reloc]   GOT before write: 0x{:x}", before_val);
-                        }
-                    }
-                    
-                    if let Some(sym_addr) = self.resolve_symbol_for_reloc(&name, ctx) {
-                        let val = (sym_addr as i64 + addend) as usize;
-                        unsafe {
-                            ptr::write_volatile(reloc_addr, val);  // Use write_volatile to ensure write happens
-                        }
-                        
-                        // Debug: verify write for string functions
-                        if is_str_func {
-                            unsafe {
-                                let written_val = ptr::read_volatile(reloc_addr);
-                                if val != written_val {
-                                    println!("[Reloc] !!! WRITE FAILED: {} -> wrote 0x{:x} but read 0x{:x}", 
-                                             name, val, written_val);
-                                } else {
-                                    println!("[Reloc]   {} -> 0x{:x} (verified OK)", name, val);
-                        }
-                            }
-                        }
-                        
-                        Ok(true)
-                    } else {
-                        // Check if it's a weak symbol
-                        if self.is_weak_symbol(r_sym) {
-                            unsafe {
-                                *reloc_addr = 0;
-                            }
-                            println!("[Reloc] Weak symbol set to 0: {}", name);
-                            return Ok(true);
-                        }
-                        
-                        if name.starts_with("__kmp_") {
-                            println!("[Reloc] CRITICAL ERROR: Missing OpenMP symbol: {}", name);
-                            return Ok(false);
-                        }
-                        
-                        // Log all unresolved symbols - this is critical for debugging
-                        println!("[Reloc] ERROR: Unresolved symbol: {} (setting to 0)", name);
-                        unsafe {
-                            *reloc_addr = 0;  // Set to 0 so we can see where crash happens
-                        }
-                        Ok(true)  // Continue loading to see all issues
-                    }
-                } else {
-                    Ok(true)
-                }
+
+            #[cfg(target_arch = "aarch64")]
+            R_AARCH64_TLSDESC => {
+                self.process_tls_desc(r_sym, reloc_addr, addend, ctx)
+            }
+
+            // =========================================================
+            // x86_64 Relocations
+            // =========================================================
+            #[cfg(target_arch = "x86_64")]
+            R_X86_64_RELATIVE => {
+                let val = (self.load_bias as i64 + addend) as usize;
+                unsafe { *reloc_addr = val; }
+                Ok(true)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            R_X86_64_64 => { // Similar to ABS64, but for 64-bit
+                 // If r_sym is 0, it behaves like RELATIVE
+                 if r_sym == 0 {
+                     let val = (self.load_bias as i64 + addend) as usize;
+                     unsafe { *reloc_addr = val; }
+                     Ok(true)
+                 } else {
+                     self.process_global_reloc(r_sym, reloc_addr, addend, ctx, "x86_64")
+                 }
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+                self.process_global_reloc(r_sym, reloc_addr, addend, ctx, "x86_64")
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            R_X86_64_COPY => {
+                self.process_copy_reloc(r_sym, reloc_addr, ctx)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            R_X86_64_IRELATIVE => {
+                // On x86_64, IRELATIVE usually doesn't have an addend in RELA for the resolver?
+                // Actually it does.
+                let resolver_addr = (self.load_bias as i64 + addend) as usize;
+                self.ifunc_relocations.push((reloc_addr as usize, resolver_addr));
+                Ok(true)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            R_X86_64_DTPMOD64 => {
+                self.process_tls_dtpmod(r_sym, reloc_addr, ctx)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            R_X86_64_DTPOFF64 => {
+                 self.process_tls_dtprel(r_sym, reloc_addr, addend, ctx)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            R_X86_64_TLSDESC => {
+                 self.process_tls_desc(r_sym, reloc_addr, addend, ctx)
+            }
+
+            // =========================================================
+            // ARM (32-bit) Relocations
+            // =========================================================
+            #[cfg(target_arch = "arm")]
+            R_ARM_RELATIVE => {
+                // ARM RELATIVE: *addr += load_bias
+                // Note: For REL (no addend param), addend is read from *addr. 
+                // But our do_relocation receives 'addend' which is either explicit (RELA) or read from *reloc_addr (REL).
+                let val = (self.load_bias as i64 + addend) as usize;
+                unsafe { *reloc_addr = val; }
+                Ok(true)
+            }
+
+            #[cfg(target_arch = "arm")]
+            R_ARM_ABS32 => {
+                 if r_sym == 0 {
+                     let val = (self.load_bias as i64 + addend) as usize;
+                     unsafe { *reloc_addr = val; }
+                     Ok(true)
+                 } else {
+                     self.process_global_reloc(r_sym, reloc_addr, addend, ctx, "ARM")
+                 }
+            }
+
+            #[cfg(target_arch = "arm")]
+            R_ARM_GLOB_DAT | R_ARM_JUMP_SLOT => {
+                self.process_global_reloc(r_sym, reloc_addr, addend, ctx, "ARM")
+            }
+
+            #[cfg(target_arch = "arm")]
+            R_ARM_TLS_DTPMOD32 => {
+                self.process_tls_dtpmod(r_sym, reloc_addr, ctx)
+            }
+
+            #[cfg(target_arch = "arm")]
+            R_ARM_TLS_DTPOFF32 => {
+                self.process_tls_dtprel(r_sym, reloc_addr, addend, ctx)
             }
             
-            R_AARCH64_TLS_DTPMOD64 | R_AARCH64_TLS_DTPREL64 | R_AARCH64_TLS_TPREL64 | R_AARCH64_TLSDESC => {
-                // TLS relocations - for now, print a warning as full TLS support is complex
-                if let Some(name) = self.get_sym_name(r_sym) {
-                    println!("[Reloc] Warning: TLS relocation not fully supported for symbol: {}", name);
-                }
-                // Return Ok(true) to avoid failing the whole load
+            #[cfg(target_arch = "arm")]
+            R_ARM_TLS_DESC => {
+                self.process_tls_desc(r_sym, reloc_addr, addend, ctx)
+            }
+
+             // =========================================================
+            // x86 (32-bit) Relocations
+            // =========================================================
+            #[cfg(target_arch = "x86")]
+            R_386_RELATIVE => {
+                let val = (self.load_bias as i64 + addend) as usize;
+                unsafe { *reloc_addr = val; }
                 Ok(true)
+            }
+
+            #[cfg(target_arch = "x86")]
+            R_386_32 => {
+                 if r_sym == 0 {
+                     let val = (self.load_bias as i64 + addend) as usize;
+                     unsafe { *reloc_addr = val; }
+                     Ok(true)
+                 } else {
+                     self.process_global_reloc(r_sym, reloc_addr, addend, ctx, "x86")
+                 }
+            }
+
+            #[cfg(target_arch = "x86")]
+            R_386_GLOB_DAT | R_386_JMP_SLOT => {
+                self.process_global_reloc(r_sym, reloc_addr, addend, ctx, "x86")
+            }
+
+             #[cfg(target_arch = "x86")]
+            R_386_TLS_DTPMOD32 => {
+                self.process_tls_dtpmod(r_sym, reloc_addr, ctx)
+            }
+
+            #[cfg(target_arch = "x86")]
+            R_386_TLS_DTPOFF32 => {
+                self.process_tls_dtprel(r_sym, reloc_addr, addend, ctx)
+            }
+            
+            #[cfg(target_arch = "x86")]
+            R_386_TLS_DESC => {
+                self.process_tls_desc(r_sym, reloc_addr, addend, ctx)
             }
             
             _ => {
@@ -559,7 +703,155 @@ impl ElfLoader {
             }
         }
     }
+
+    // Helper to process COPY relocations
+    #[allow(dead_code)]
+    fn process_copy_reloc(&self, r_sym: u32, reloc_addr: *mut usize, ctx: &Rc<RefCell<LinkerContext>>) -> Result<bool, String> {
+        if let Some(name) = self.get_sym_name(r_sym) {
+            if let Some(sym_addr) = self.resolve_symbol_for_reloc(&name, ctx) {
+                let sym_size = self.get_sym_size(r_sym).unwrap_or(0);
+                if sym_size > 0 && self.is_valid_ptr(sym_addr) {
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            sym_addr as *const u8,
+                            reloc_addr as *mut u8,
+                            sym_size,
+                        );
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // Helper to process standard global relocations (GLOB_DAT, JUMP_SLOT, ABS)
+    fn process_global_reloc(
+        &self, 
+        r_sym: u32, 
+        reloc_addr: *mut usize, 
+        addend: i64, 
+        ctx: &Rc<RefCell<LinkerContext>>,
+        _arch: &str
+    ) -> Result<bool, String> {
+        if r_sym == 0 {
+             let val = (self.load_bias as i64 + addend) as usize;
+             unsafe { *reloc_addr = val; }
+             return Ok(true);
+        }
+
+        if let Some(name) = self.get_sym_name(r_sym) {
+            if let Some(sym_addr) = self.resolve_symbol_for_reloc(&name, ctx) {
+                let val = (sym_addr as i64 + addend) as usize;
+                unsafe { ptr::write_volatile(reloc_addr, val); }
+                Ok(true)
+            } else {
+                if self.is_weak_symbol(r_sym) {
+                    unsafe { *reloc_addr = 0; }
+                    Ok(true)
+                } else {
+                     println!("[Reloc] Error: Unresolved symbol: {}", name);
+                     unsafe { *reloc_addr = 0; }
+                     Ok(true) // Don't crash, just warn
+                }
+            }
+        } else {
+            Ok(true)
+        }
+    }
+
+    // Helper for TLS DTPMOD
+    fn process_tls_dtpmod(&self, r_sym: u32, reloc_addr: *mut usize, ctx: &Rc<RefCell<LinkerContext>>) -> Result<bool, String> {
+        if r_sym == 0 {
+            if self.tls_module_id == 0 {
+                println!("[Reloc] Warning: TLS_DTPMOD for local symbol but no PT_TLS");
+            }
+            unsafe { *reloc_addr = self.tls_module_id; }
+        } else {
+            if let Some(name) = self.get_sym_name(r_sym) {
+                if let Some((mod_id, _)) = self.resolve_tls_symbol(&name, ctx) {
+                     unsafe { *reloc_addr = mod_id; }
+                } else {
+                     println!("[Reloc] Error: Could not resolve TLS symbol: {}", name);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    // Helper for TLS DTPREL (Offset)
+    fn process_tls_dtprel(&self, r_sym: u32, reloc_addr: *mut usize, addend: i64, ctx: &Rc<RefCell<LinkerContext>>) -> Result<bool, String> {
+        if r_sym == 0 {
+            unsafe { *reloc_addr = addend as usize; }
+        } else {
+            if let Some(name) = self.get_sym_name(r_sym) {
+                if let Some((_, offset)) = self.resolve_tls_symbol(&name, ctx) {
+                     unsafe { *reloc_addr = (offset as i64 + addend) as usize; }
+                } else {
+                     println!("[Reloc] Error: Could not resolve TLS symbol: {}", name);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    // Helper for TLSDESC
+    fn process_tls_desc(&mut self, r_sym: u32, reloc_addr: *mut usize, addend: i64, ctx: &Rc<RefCell<LinkerContext>>) -> Result<bool, String> {
+        let mut mod_id = self.tls_module_id;
+        let mut offset = 0;
+        
+        if r_sym != 0 {
+            if let Some(name) = self.get_sym_name(r_sym) {
+                if let Some((id, off)) = self.resolve_tls_symbol(&name, ctx) {
+                    mod_id = id;
+                    offset = off;
+                } else {
+                     if self.is_weak_symbol(r_sym) {
+                         mod_id = 0;
+                         offset = 0;
+                     } else {
+                        println!("[Reloc] Error: Could not resolve TLS symbol: {}", name);
+                     }
+                }
+            }
+        } else {
+            offset = 0; 
+        }
+        
+        offset = (offset as i64 + addend) as usize;
+
+        let arg = Box::new([mod_id, offset]);
+        let arg_ptr = arg.as_ptr();
+        self.tlsdesc_args.push(arg);
+        
+        unsafe {
+            *reloc_addr = tls::tlsdesc_resolver_trampoline as usize;
+            *(reloc_addr.add(1)) = arg_ptr as usize;
+        }
+        
+        Ok(true)
+    }
     
+    fn resolve_tls_symbol(&self, name: &str, ctx: &Rc<RefCell<LinkerContext>>) -> Option<(usize, usize)> {
+        // 1. Try local module
+        if let Some(offset) = self.get_export_tls_symbol(name) {
+            return Some((self.tls_module_id, offset));
+        }
+
+        // 2. Try other modules in context
+        // Accessing modules via crate-public field
+        let ctx_ref = ctx.borrow();
+        for loader in ctx_ref.modules.values() {
+             if let Ok(l) = loader.try_borrow() {
+                 if let Some(offset) = l.get_export_tls_symbol(name) {
+                     return Some((l.get_tls_module_id(), offset));
+                 }
+             }
+        }
+        
+        None
+    }
+
     fn resolve_symbol_for_reloc(&self, name: &str, ctx: &Rc<RefCell<LinkerContext>>) -> Option<usize> {
         // Special handling for __dso_handle - each SO needs its own
         // __dso_handle is used by __cxa_atexit to identify which DSO registered an atexit handler
@@ -567,6 +859,12 @@ impl ElfLoader {
             // Return the base address of this SO as its __dso_handle
             // This is what the system linker does
             return Some(self.base_addr);
+        }
+
+        // Emulated TLS entrypoint used by clang (__emutls_*). Some builds import
+        // __emutls_get_address without a backing runtime; we provide a compatible implementation.
+        if name == "__emutls_get_address" || name.starts_with("__emutls_get_address@") {
+            return Some(tls::__emutls_get_address as usize);
         }
         
         // For C++ runtime symbols, prefer local (SO's own) implementation first
@@ -903,6 +1201,7 @@ impl ElfLoader {
         (result, pos)
     }
     
+    #[allow(dead_code)]
     fn get_sym_size(&self, sym_idx: u32) -> Option<usize> {
         if self.symtab.is_null() {
             return None;
@@ -1156,7 +1455,7 @@ impl ElfLoader {
                     return Err("Infinite loop in dynamic".to_string());
                 }
                 let dyn_entry = &*self.dynamic.add(i);
-                if dyn_entry.d_tag == DT_NULL as i64 {
+                if dyn_entry.d_tag == DT_NULL as _ {
                     break;
                 }
 
@@ -1397,9 +1696,12 @@ impl ElfLoader {
                     };
                     
                     if self.is_valid_ptr(eh_frame_addr) {
-                        __register_frame(eh_frame_addr as *const u8);
-                        self.eh_frame_addr = eh_frame_addr as *const u8;
-                        println!("[EH] Registered exception frame at 0x{:x}", eh_frame_addr);
+                        #[cfg(not(target_arch = "arm"))]
+                        {
+                            __register_frame(eh_frame_addr as *const u8);
+                            self.eh_frame_addr = eh_frame_addr as *const u8;
+                            println!("[EH] Registered exception frame at 0x{:x}", eh_frame_addr);
+                        }
                     }
                 }
                 break;
@@ -1411,6 +1713,7 @@ impl ElfLoader {
 impl Drop for ElfLoader {
     fn drop(&mut self) {
         if !self.eh_frame_addr.is_null() {
+            #[cfg(not(target_arch = "arm"))]
             unsafe {
                 __deregister_frame(self.eh_frame_addr);
             }

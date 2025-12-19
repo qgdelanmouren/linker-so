@@ -80,9 +80,7 @@ impl Drop for ThreadDtorManager {
         // 我们利用这个时机调用注册的 C++ 析构函数
         // 顺序：LIFO (后注册的先析构)
         while let Some(entry) = self.handlers.pop() {
-            unsafe {
-                (entry.func)(entry.arg);
-            }
+            (entry.func)(entry.arg);
         }
     }
 }

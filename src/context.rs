@@ -9,6 +9,7 @@ use crate::loader::ElfLoader;
 use crate::xdl;
 use crate::unwind::custom_dl_iterate_phdr; // [New] 引入 Hook 函數
 use crate::hooks; // [New] 引入 Hooks
+use crate::tls; // [New] TLS Support
 
 pub struct LinkerContext {
     // [Fix] 改為 pub(crate) 讓 unwind.rs 可以遍歷模塊
@@ -56,10 +57,21 @@ impl LinkerContext {
             if Self::is_system_lib(&dep_name) {
                 ctx.borrow_mut().load_system_lib(&dep_name);
             } else {
-                // 內存庫的依賴如果是其他的內存庫，這裡需要額外邏輯處理
-                // 目前假設內存庫只依賴系統庫
-                println!("[Context] Warning: Memory lib {} depends on {}, skipping recursion for now.", name, dep_name);
+                if let Some(dep_bytes) = crate::embedded_lib_bytes(&dep_name) {
+                    let _ = Self::load_library_from_memory(ctx.clone(), &dep_name, dep_bytes)?;
+                } else {
+                    return Err(format!(
+                        "Missing embedded dependency: {} (needed by {})",
+                        dep_name, name
+                    ));
+                }
             }
+        }
+
+        // Try to load libc++_shared.so if not already loaded (same as file loading)
+        {
+            let loader_ref = loader.borrow();
+            ctx.borrow_mut().try_load_cxx_runtime(&loader_ref);
         }
 
         loader.borrow_mut().relocate(ctx.clone())?;
@@ -268,6 +280,12 @@ impl LinkerContext {
         }
         if symbol_name == "__cxa_thread_atexit_impl" {
             return Some(hooks::custom___cxa_thread_atexit_impl as usize);
+        }
+        if symbol_name == "__tls_get_addr" {
+            return Some(tls::__tls_get_addr as usize);
+        }
+        if symbol_name == "__emutls_get_address" {
+            return Some(tls::__emutls_get_address as usize);
         }
 
         // 2. [Priority 1] 查自定义模块导出的符号

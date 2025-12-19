@@ -90,6 +90,20 @@ pub const DT_ANDROID_RELR: usize = 0x6fffe000;
 pub const DT_ANDROID_RELRSZ: usize = 0x6fffe001;
 pub const DT_ANDROID_RELRENT: usize = 0x6fffe003;
 
+// Symbol Types (st_info & 0xf)
+pub const STT_NOTYPE: u8 = 0;
+pub const STT_OBJECT: u8 = 1;
+pub const STT_FUNC: u8 = 2;
+pub const STT_SECTION: u8 = 3;
+pub const STT_FILE: u8 = 4;
+pub const STT_COMMON: u8 = 5;
+pub const STT_TLS: u8 = 6;
+
+// Symbol Bindings (st_info >> 4)
+pub const STB_LOCAL: u8 = 0;
+pub const STB_GLOBAL: u8 = 1;
+pub const STB_WEAK: u8 = 2;
+
 // Relocation Types (AArch64)
 pub const R_AARCH64_NONE: u32 = 0;
 pub const R_AARCH64_ABS64: u32 = 257;
@@ -114,6 +128,41 @@ pub const R_ARM_REL32: u32 = 3;
 pub const R_ARM_GLOB_DAT: u32 = 21;
 pub const R_ARM_JUMP_SLOT: u32 = 22;
 pub const R_ARM_RELATIVE: u32 = 23;
+pub const R_ARM_TLS_DTPMOD32: u32 = 17;
+pub const R_ARM_TLS_DTPOFF32: u32 = 18;
+pub const R_ARM_TLS_TPOFF32: u32 = 19;
+pub const R_ARM_TLS_DESC: u32 = 13; // Check specific value for ARM TLSDESC
+pub const R_ARM_IRELATIVE: u32 = 160;
+
+// Relocation Types (x86_64)
+pub const R_X86_64_64: u32 = 1;
+pub const R_X86_64_PC32: u32 = 2;
+pub const R_X86_64_COPY: u32 = 5;
+pub const R_X86_64_GLOB_DAT: u32 = 6;
+pub const R_X86_64_JUMP_SLOT: u32 = 7;
+pub const R_X86_64_RELATIVE: u32 = 8;
+pub const R_X86_64_DTPMOD64: u32 = 16;
+pub const R_X86_64_DTPOFF64: u32 = 17;
+pub const R_X86_64_TPOFF64: u32 = 18;
+pub const R_X86_64_TLSDESC: u32 = 36;
+pub const R_X86_64_IRELATIVE: u32 = 37;
+
+// Relocation Types (x86 i386)
+pub const R_386_32: u32 = 1;
+pub const R_386_PC32: u32 = 2;
+pub const R_386_GOT32: u32 = 3;
+pub const R_386_PLT32: u32 = 4;
+pub const R_386_COPY: u32 = 5;
+pub const R_386_GLOB_DAT: u32 = 6;
+pub const R_386_JMP_SLOT: u32 = 7;
+pub const R_386_RELATIVE: u32 = 8;
+pub const R_386_GOTOFF: u32 = 9;
+pub const R_386_GOTPC: u32 = 10;
+pub const R_386_TLS_TPOFF: u32 = 14;
+pub const R_386_TLS_DTPMOD32: u32 = 35;
+pub const R_386_TLS_DTPOFF32: u32 = 36;
+pub const R_386_TLS_DESC: u32 = 41;
+pub const R_386_IRELATIVE: u32 = 42;
 
 // ==========================================
 // 32-bit 结构体
