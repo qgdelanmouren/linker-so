@@ -165,6 +165,89 @@ pub const R_386_TLS_DESC: u32 = 41;
 pub const R_386_IRELATIVE: u32 = 42;
 
 // ==========================================
+// Symbol Versioning 常量
+// ==========================================
+
+/// 本地版本 (未导出)
+pub const VER_NDX_LOCAL: u16 = 0;
+/// 全局版本 (基础版本)
+pub const VER_NDX_GLOBAL: u16 = 1;
+/// 隐藏版本标志
+pub const VERSYM_HIDDEN: u16 = 0x8000;
+/// 版本索引掩码
+pub const VERSYM_VERSION: u16 = 0x7fff;
+
+// Verdef 标志
+pub const VER_FLG_BASE: u16 = 0x1;
+pub const VER_FLG_WEAK: u16 = 0x2;
+
+// ==========================================
+// Symbol Versioning 结构体
+// ==========================================
+
+/// .gnu.version_d 条目 (Version Definition)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Elf_Verdef {
+    /// 版本修订号 (通常为 1)
+    pub vd_version: u16,
+    /// 标志 (VER_FLG_*)
+    pub vd_flags: u16,
+    /// 版本索引
+    pub vd_ndx: u16,
+    /// Verdaux 条目数量
+    pub vd_cnt: u16,
+    /// 版本名称哈希
+    pub vd_hash: u32,
+    /// 到 Verdaux 数组的偏移
+    pub vd_aux: u32,
+    /// 到下一个 Verdef 的偏移 (0 表示最后一个)
+    pub vd_next: u32,
+}
+
+/// .gnu.version_d 辅助条目
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Elf_Verdaux {
+    /// 版本名称在 strtab 中的偏移
+    pub vda_name: u32,
+    /// 到下一个 Verdaux 的偏移
+    pub vda_next: u32,
+}
+
+/// .gnu.version_r 条目 (Version Requirement)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Elf_Verneed {
+    /// 版本修订号 (通常为 1)
+    pub vn_version: u16,
+    /// Vernaux 条目数量
+    pub vn_cnt: u16,
+    /// 库文件名在 strtab 中的偏移
+    pub vn_file: u32,
+    /// 到 Vernaux 数组的偏移
+    pub vn_aux: u32,
+    /// 到下一个 Verneed 的偏移
+    pub vn_next: u32,
+}
+
+/// .gnu.version_r 辅助条目
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Elf_Vernaux {
+    /// 依赖的版本哈希
+    pub vna_hash: u32,
+    /// 标志
+    pub vna_flags: u16,
+    /// 此依赖的版本索引 (用于 versym 匹配)
+    pub vna_other: u16,
+    /// 版本名称在 strtab 中的偏移
+    pub vna_name: u32,
+    /// 到下一个 Vernaux 的偏移
+    pub vna_next: u32,
+}
+
+// ==========================================
 // 32-bit 结构体
 // ==========================================
 #[repr(C)]

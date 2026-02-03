@@ -11,54 +11,157 @@ use crate::unwind::custom_dl_iterate_phdr; // [New] 引入 Hook 函數
 use crate::hooks; // [New] 引入 Hooks
 use crate::tls; // [New] TLS Support
 
+pub struct LinkerNamespace {
+    modules: HashMap<String, Rc<RefCell<ElfLoader>>>,
+    search_paths: Vec<String>,
+    linked_namespaces: Vec<String>,
+}
+
+impl LinkerNamespace {
+    fn new(search_paths: Vec<String>) -> Self {
+        Self {
+            modules: HashMap::new(),
+            search_paths,
+            linked_namespaces: Vec::new(),
+        }
+    }
+}
+
 pub struct LinkerContext {
-    // [Fix] 改為 pub(crate) 讓 unwind.rs 可以遍歷模塊
-    pub(crate) modules: HashMap<String, Rc<RefCell<ElfLoader>>>,
-    
+    namespaces: HashMap<String, LinkerNamespace>,
     system_handles: HashMap<String, *mut c_void>,
     fallback_handle: *mut c_void,
 }
 
 impl LinkerContext {
     pub fn new() -> Rc<RefCell<Self>> {
+        let mut namespaces: HashMap<String, LinkerNamespace> = HashMap::new();
+        namespaces.insert(
+            "default".to_string(),
+            LinkerNamespace::new(vec!["/data/local/tmp".to_string()]),
+        );
         Rc::new(RefCell::new(Self {
-            modules: HashMap::new(),
+            namespaces,
             system_handles: HashMap::new(),
             fallback_handle: std::ptr::null_mut(),
         }))
     }
+
+    pub fn create_namespace(&mut self, name: &str, search_paths: Vec<String>) {
+        self.namespaces
+            .entry(name.to_string())
+            .or_insert_with(|| LinkerNamespace::new(search_paths));
+    }
+
+    pub fn link_namespaces(&mut self, from: &str, to: &str) {
+        if let Some(ns) = self.namespaces.get_mut(from) {
+            if !ns.linked_namespaces.iter().any(|n| n == to) {
+                ns.linked_namespaces.push(to.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn snapshot_modules(&self) -> Vec<(String, Rc<RefCell<ElfLoader>>)> {
+        let mut out: Vec<(String, Rc<RefCell<ElfLoader>>)> = Vec::new();
+        for ns in self.namespaces.values() {
+            for (name, loader) in &ns.modules {
+                out.push((name.clone(), loader.clone()));
+            }
+        }
+        out
+    }
+
+     pub(crate) fn snapshot_modules_in_namespace(
+         &self,
+         namespace: &str,
+     ) -> Vec<Rc<RefCell<ElfLoader>>> {
+         let mut out: Vec<Rc<RefCell<ElfLoader>>> = Vec::new();
+
+         let Some(ns) = self.namespaces.get(namespace) else {
+             return out;
+         };
+
+         for loader in ns.modules.values() {
+             out.push(loader.clone());
+         }
+         for linked in &ns.linked_namespaces {
+             if let Some(ns2) = self.namespaces.get(linked) {
+                 for loader in ns2.modules.values() {
+                     out.push(loader.clone());
+                 }
+             }
+         }
+
+         out
+     }
 
     pub fn set_fallback_handle(&mut self, handle: *mut c_void) {
         self.fallback_handle = handle;
     }
 
     // ==========================================
-    // 內存加載入口
+    // 內存加載入口 (处理加密的 SO)
     // ==========================================
     pub fn load_library_from_memory(
         ctx: Rc<RefCell<Self>>,
         name: &str,
-        data: &'static [u8]
+        encrypted_data: &'static [u8]
     ) -> Result<Rc<RefCell<ElfLoader>>, String> {
-        if let Some(loader) = ctx.borrow().modules.get(name) {
-            return Ok(loader.clone());
+        Self::load_library_from_memory_in_namespace(ctx, "default", name, encrypted_data)
+    }
+
+    pub fn load_library_from_memory_in_namespace(
+        ctx: Rc<RefCell<Self>>,
+        namespace: &str,
+        name: &str,
+        encrypted_data: &'static [u8],
+    ) -> Result<Rc<RefCell<ElfLoader>>, String> {
+        let existing = {
+            let ctx_borrow = ctx.borrow();
+            ctx_borrow
+                .namespaces
+                .get(namespace)
+                .and_then(|ns| ns.modules.get(name).cloned())
+        };
+        if let Some(loader) = existing {
+            return Ok(loader);
         }
 
         println!("[Context] Loading memory library: {}", name);
-        let loader = Rc::new(RefCell::new(ElfLoader::new_memory(name, data)));
         
-        ctx.borrow_mut().modules.insert(name.to_string(), loader.clone());
+        // 解密 SO 数据
+        let decrypted = crate::crypto::decrypt_so(encrypted_data)?;
+        
+        // 将解密后的数据转换为 'static 生命周期
+        // 注意: 这会泄漏内存，但 SO 通常在整个进程生命周期内都需要
+        let static_data: &'static [u8] = Box::leak(decrypted.into_boxed_slice());
+        
+        let loader = Rc::new(RefCell::new(ElfLoader::new_memory(name, static_data, namespace)));
+
+        {
+            let mut ctx_mut = ctx.borrow_mut();
+            ctx_mut
+                .namespaces
+                .entry(namespace.to_string())
+                .or_insert_with(|| LinkerNamespace::new(vec!["/data/local/tmp".to_string()]))
+                .modules
+                .insert(name.to_string(), loader.clone());
+        }
 
         loader.borrow_mut().map()?;
-        
-        // 遞歸加載依賴
+
         let needed_libs = loader.borrow_mut().parse_needed()?;
         for dep_name in needed_libs {
             if Self::is_system_lib(&dep_name) {
                 ctx.borrow_mut().load_system_lib(&dep_name);
             } else {
                 if let Some(dep_bytes) = crate::embedded_lib_bytes(&dep_name) {
-                    let _ = Self::load_library_from_memory(ctx.clone(), &dep_name, dep_bytes)?;
+                    let _ = Self::load_library_from_memory_in_namespace(
+                        ctx.clone(),
+                        namespace,
+                        &dep_name,
+                        dep_bytes,
+                    )?;
                 } else {
                     return Err(format!(
                         "Missing embedded dependency: {} (needed by {})",
@@ -68,7 +171,6 @@ impl LinkerContext {
             }
         }
 
-        // Try to load libc++_shared.so if not already loaded (same as file loading)
         {
             let loader_ref = loader.borrow();
             ctx.borrow_mut().try_load_cxx_runtime(&loader_ref);
@@ -88,45 +190,80 @@ impl LinkerContext {
         name: &str, 
         parent_path: Option<&Path>
     ) -> Result<Rc<RefCell<ElfLoader>>, String> {
-        if let Some(loader) = ctx.borrow().modules.get(name) {
-            return Ok(loader.clone());
+        Self::load_library_in_namespace(ctx, "default", name, parent_path)
+    }
+
+    pub fn load_library_in_namespace(
+        ctx: Rc<RefCell<Self>>,
+        namespace: &str,
+        name: &str,
+        parent_path: Option<&Path>,
+    ) -> Result<Rc<RefCell<ElfLoader>>, String> {
+        let existing = {
+            let ctx_borrow = ctx.borrow();
+            ctx_borrow
+                .namespaces
+                .get(namespace)
+                .and_then(|ns| ns.modules.get(name).cloned())
+        };
+        if let Some(loader) = existing {
+            return Ok(loader);
         }
 
-        // 路徑推導
+        let ns_search_paths: Vec<String> = {
+            let ctx_borrow = ctx.borrow();
+            ctx_borrow
+                .namespaces
+                .get(namespace)
+                .map(|ns| ns.search_paths.clone())
+                .unwrap_or_else(|| vec!["/data/local/tmp".to_string()])
+        };
+
         let mut target_path = None;
         if let Some(parent) = parent_path {
             if let Some(parent_dir) = parent.parent() {
                 let candidate = parent_dir.join(name);
-                if candidate.exists() { target_path = Some(candidate); }
+                if candidate.exists() {
+                    target_path = Some(candidate);
+                }
             }
         }
         if target_path.is_none() {
-            let candidate = Path::new("/data/local/tmp").join(name);
-            if candidate.exists() { target_path = Some(candidate); }
+            for p in &ns_search_paths {
+                let candidate = Path::new(p).join(name);
+                if candidate.exists() {
+                    target_path = Some(candidate);
+                    break;
+                }
+            }
         }
 
         if let Some(path) = target_path {
             let path_str = path.to_str().unwrap().to_string();
             println!("[Context] Loading user library: {} from {:?}", name, path);
 
-            let loader = Rc::new(RefCell::new(ElfLoader::new_file(name, &path_str)));
-            ctx.borrow_mut().modules.insert(name.to_string(), loader.clone());
+            let loader = Rc::new(RefCell::new(ElfLoader::new_file(name, &path_str, namespace)));
+            {
+                let mut ctx_mut = ctx.borrow_mut();
+                ctx_mut
+                    .namespaces
+                    .entry(namespace.to_string())
+                    .or_insert_with(|| LinkerNamespace::new(vec!["/data/local/tmp".to_string()]))
+                    .modules
+                    .insert(name.to_string(), loader.clone());
+            }
 
             loader.borrow_mut().map()?;
             let needed_libs = loader.borrow_mut().parse_needed()?;
-            
-            // 遞歸加載
+
             for dep_name in needed_libs {
                 if Self::is_system_lib(&dep_name) {
                     ctx.borrow_mut().load_system_lib(&dep_name);
                 } else {
-                    let _ = Self::load_library(ctx.clone(), &dep_name, Some(&path));
+                    let _ = Self::load_library_in_namespace(ctx.clone(), namespace, &dep_name, Some(&path));
                 }
             }
-            
-            // Try to load libc++_shared.so if not already loaded
-            // Many C++ libraries need it even if not explicitly declared as dependency
-            // But skip if SO has its own static C++ runtime
+
             {
                 let loader_ref = loader.borrow();
                 ctx.borrow_mut().try_load_cxx_runtime(&loader_ref);
@@ -167,41 +304,28 @@ impl LinkerContext {
     }
     
     fn try_load_cxx_runtime(&mut self, loader: &crate::loader::ElfLoader) {
-        // Check if the SO has its own C++ runtime (statically linked)
-        // Detection methods:
-        // 1. SO exports C++ runtime symbols (like __cxa_throw)
-        // 2. SO does NOT depend on libc++_shared.so or libc++.so (meaning it statically linked C++)
-        
         let exports_cxx_symbols = loader.get_export_symbol("__cxa_throw").is_some() ||
                                    loader.get_export_symbol("__cxa_begin_catch").is_some() ||
                                    loader.get_export_symbol("__gxx_personality_v0").is_some() ||
                                    loader.get_export_symbol("__cxa_allocate_exception").is_some();
         
-        // Check if SO depends on any C++ runtime library
         let needed_libs = loader.get_needed_libs();
         let depends_on_cxx_runtime = needed_libs.iter().any(|lib| {
             lib.contains("libc++") || lib.contains("libstdc++")
         });
         
-        // If SO exports C++ symbols OR doesn't depend on any C++ runtime,
-        // it likely has statically linked C++ - don't load system C++ runtime
         if exports_cxx_symbols {
             println!("[Context] SO exports C++ runtime symbols, skipping system libc++ to avoid conflicts");
             return;
         }
         
         if !depends_on_cxx_runtime {
-            // SO doesn't depend on C++ runtime library
-            // If it uses C++, it must have statically linked it
-            // We should NOT load system C++ runtime to avoid conflicts
             println!("[Context] SO doesn't depend on C++ runtime lib, assuming static linkage - skipping system libc++");
             return;
         }
         
-        // Only load system C++ runtime if SO explicitly depends on it
         println!("[Context] SO depends on C++ runtime, will use system library");
         
-        // Try to load C++ runtime libraries
         let cxx_libs = [
             "libc++_shared.so",
             "libc++.so",
@@ -267,8 +391,10 @@ impl LinkerContext {
     /// 注意：不再硬编码"必须从系统解析"的函数列表
     /// 如果用户的 SO 导出了 open/malloc 等函数，应该优先使用用户的实现
     pub fn resolve_symbol(&self, symbol_name: &str) -> Option<usize> {
-        
-        // 1. [Hook] 特殊符号劫持
+        self.resolve_symbol_in_namespace("default", symbol_name)
+    }
+
+    pub fn resolve_symbol_in_namespace(&self, namespace: &str, symbol_name: &str) -> Option<usize> {
         if symbol_name == "dl_iterate_phdr" {
             return Some(custom_dl_iterate_phdr as usize);
         }
@@ -288,48 +414,50 @@ impl LinkerContext {
             return Some(tls::__emutls_get_address as usize);
         }
 
-        // 2. [Priority 1] 查自定义模块导出的符号
-        // 尊重用户自己的实现：如果用户 SO 导出了某个符号，优先使用它
-        // 这样用户可以自己实现 open/malloc 等函数而不会被系统版本覆盖
-        for loader in self.modules.values() {
-            if let Ok(l) = loader.try_borrow() {
-                if let Some(addr) = l.get_export_symbol(symbol_name) {
-                    return Some(addr);
+        if let Some(ns) = self.namespaces.get(namespace) {
+            for loader in ns.modules.values() {
+                if let Ok(l) = loader.try_borrow() {
+                    if let Some(addr) = l.get_export_symbol(symbol_name) {
+                        return Some(addr);
+                    }
+                }
+            }
+            for linked in &ns.linked_namespaces {
+                if let Some(ns2) = self.namespaces.get(linked) {
+                    for loader in ns2.modules.values() {
+                        if let Ok(l) = loader.try_borrow() {
+                            if let Some(addr) = l.get_export_symbol(symbol_name) {
+                                return Some(addr);
+                            }
+                        }
+                    }
                 }
             }
         }
 
         let c_name = CString::new(symbol_name).unwrap();
 
-        // 3. [Priority 2] dlsym(RTLD_DEFAULT) - 推荐方式
-        // 优点：
-        // - 正确处理 IFUNC（间接函数）解析
-        // - 能找到所有已加载库的公开符号
-        // - 跨 Android 版本兼容性好
         unsafe {
             let addr = libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr());
-            if !addr.is_null() { 
-                return Some(addr as usize); 
+            if !addr.is_null() {
+                return Some(addr as usize);
             }
         }
 
-        // 4. [Priority 3] xdl_sym 查找显式加载的库
-        // 用于查找某些私有符号（dlsym 可能找不到）
         for handle in self.system_handles.values() {
             unsafe {
                 let addr = xdl::xdl_sym(*handle, c_name.as_ptr(), std::ptr::null_mut());
-                if !addr.is_null() { 
-                    return Some(addr as usize); 
+                if !addr.is_null() {
+                    return Some(addr as usize);
                 }
             }
         }
 
-        // 5. [Priority 4] Fallback 句柄
         if !self.fallback_handle.is_null() {
             unsafe {
                 let addr = libc::dlsym(self.fallback_handle, c_name.as_ptr());
-                if !addr.is_null() { 
-                    return Some(addr as usize); 
+                if !addr.is_null() {
+                    return Some(addr as usize);
                 }
             }
         }
@@ -337,9 +465,9 @@ impl LinkerContext {
         None
     }
     
-
-    
     pub fn get_module(&self, name: &str) -> Option<Rc<RefCell<ElfLoader>>> {
-        self.modules.get(name).cloned()
+        self.namespaces
+            .get("default")
+            .and_then(|ns| ns.modules.get(name).cloned())
     }
 }

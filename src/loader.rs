@@ -35,6 +35,7 @@ enum LoaderSource {
 }
 
 pub struct ElfLoader {
+    namespace: String,
     source_type: LoaderSource,
     base_addr: usize,
     load_size: usize,
@@ -85,19 +86,27 @@ pub struct ElfLoader {
     // TLS support
     tls_module_id: usize,
     tlsdesc_args: Vec<Box<[usize; 2]>>,
+    
+    // Symbol versioning support
+    versym: *const u16,           // .gnu.version - 每个符号的版本索引
+    verdef: *const u8,            // .gnu.version_d - 版本定义
+    verdef_num: usize,            // 版本定义数量
+    verneed: *const u8,           // .gnu.version_r - 版本需求
+    verneed_num: usize,           // 版本需求数量
 }
 
 impl ElfLoader {
-    pub fn new_file(_name: &str, path: &str) -> Self {
-        Self::new_internal(LoaderSource::File(path.to_string()))
+    pub fn new_file(_name: &str, path: &str, namespace: &str) -> Self {
+        Self::new_internal(LoaderSource::File(path.to_string()), namespace)
     }
 
-    pub fn new_memory(_name: &str, data: &'static [u8]) -> Self {
-        Self::new_internal(LoaderSource::Memory(data))
+    pub fn new_memory(_name: &str, data: &'static [u8], namespace: &str) -> Self {
+        Self::new_internal(LoaderSource::Memory(data), namespace)
     }
 
-    fn new_internal(source: LoaderSource) -> Self {
+    fn new_internal(source: LoaderSource, namespace: &str) -> Self {
         Self {
+            namespace: namespace.to_string(),
             source_type: source,
             base_addr: 0,
             load_size: 0,
@@ -129,6 +138,12 @@ impl ElfLoader {
             eh_frame_addr: ptr::null(),
             tls_module_id: 0,
             tlsdesc_args: Vec::new(),
+            // Symbol versioning
+            versym: ptr::null(),
+            verdef: ptr::null(),
+            verdef_num: 0,
+            verneed: ptr::null(),
+            verneed_num: 0,
         }
     }
 
@@ -839,14 +854,13 @@ impl ElfLoader {
         }
 
         // 2. Try other modules in context
-        // Accessing modules via crate-public field
-        let ctx_ref = ctx.borrow();
-        for loader in ctx_ref.modules.values() {
-             if let Ok(l) = loader.try_borrow() {
-                 if let Some(offset) = l.get_export_tls_symbol(name) {
-                     return Some((l.get_tls_module_id(), offset));
-                 }
-             }
+        let visible = { ctx.borrow().snapshot_modules_in_namespace(&self.namespace) };
+        for loader in visible {
+            if let Ok(l) = loader.try_borrow() {
+                if let Some(offset) = l.get_export_tls_symbol(name) {
+                    return Some((l.get_tls_module_id(), offset));
+                }
+            }
         }
         
         None
@@ -878,8 +892,8 @@ impl ElfLoader {
             }
         }
         
-        // Try context (system symbols)
-        if let Some(addr) = ctx.borrow().resolve_symbol(name) {
+        // Try context (namespace-aware symbols)
+        if let Some(addr) = ctx.borrow().resolve_symbol_in_namespace(&self.namespace, name) {
             if addr != 0 {
                 // Log important symbol resolutions for debugging
                 if Self::is_important_symbol(name) {
@@ -1308,6 +1322,122 @@ impl ElfLoader {
             self.get_safe_string(sym.st_name as usize)
         }
     }
+    
+    /// 获取符号的版本索引
+    fn get_sym_version_index(&self, sym_idx: usize) -> Option<u16> {
+        if self.versym.is_null() {
+            return None;
+        }
+        unsafe {
+            let versym_ptr = self.versym.add(sym_idx);
+            if !self.is_valid_ptr(versym_ptr as usize) {
+                return None;
+            }
+            Some(*versym_ptr)
+        }
+    }
+    
+    /// 获取版本定义的名称
+    /// 根据版本索引从 verdef 中查找版本名称
+    pub fn get_verdef_name(&self, ver_ndx: u16) -> Option<String> {
+        use crate::elf::{Elf_Verdef, Elf_Verdaux, VER_NDX_LOCAL, VER_NDX_GLOBAL, VERSYM_VERSION};
+        
+        if self.verdef.is_null() || self.verdef_num == 0 {
+            return None;
+        }
+        
+        let ver_idx = ver_ndx & VERSYM_VERSION;
+        if ver_idx == VER_NDX_LOCAL || ver_idx == VER_NDX_GLOBAL {
+            return None; // 本地或全局基础版本，无特定名称
+        }
+        
+        unsafe {
+            let mut verdef_ptr = self.verdef;
+            for _ in 0..self.verdef_num {
+                if !self.is_valid_ptr(verdef_ptr as usize) {
+                    break;
+                }
+                
+                let verdef = &*(verdef_ptr as *const Elf_Verdef);
+                
+                if verdef.vd_ndx == ver_idx {
+                    // 找到了，获取第一个 Verdaux 的名称
+                    let verdaux_ptr = verdef_ptr.add(verdef.vd_aux as usize) as *const Elf_Verdaux;
+                    if self.is_valid_ptr(verdaux_ptr as usize) {
+                        let verdaux = &*verdaux_ptr;
+                        return self.get_safe_string(verdaux.vda_name as usize);
+                    }
+                }
+                
+                if verdef.vd_next == 0 {
+                    break;
+                }
+                verdef_ptr = verdef_ptr.add(verdef.vd_next as usize);
+            }
+        }
+        
+        None
+    }
+    
+    /// 带版本的符号查找
+    /// 如果请求的符号有版本要求（如 "malloc@GLIBC_2.17"），会匹配版本
+    pub fn get_export_symbol_versioned(&self, name: &str, required_version: Option<&str>) -> Option<usize> {
+        use crate::elf::{VER_NDX_LOCAL, VERSYM_HIDDEN, VERSYM_VERSION};
+        
+        if self.symtab.is_null() || self.strtab.is_null() {
+            return None;
+        }
+
+        let count = if self.sym_count > 0 {
+            self.sym_count
+        } else {
+            30000
+        };
+
+        for i in 0..count {
+            unsafe {
+                let sym_ptr = self.symtab.add(i);
+                if !self.is_valid_ptr(sym_ptr as usize) {
+                    break;
+                }
+
+                let sym = &*sym_ptr;
+                if sym.st_name == 0 || sym.st_value == 0 {
+                    continue;
+                }
+
+                if let Some(s) = self.get_safe_string(sym.st_name as usize) {
+                    if s == name {
+                        // 检查版本
+                        if let Some(ver_idx) = self.get_sym_version_index(i) {
+                            // 跳过隐藏的符号（除非明确请求）
+                            if (ver_idx & VERSYM_HIDDEN) != 0 && required_version.is_none() {
+                                continue;
+                            }
+                            
+                            // 跳过本地符号
+                            let ver_ndx = ver_idx & VERSYM_VERSION;
+                            if ver_ndx == VER_NDX_LOCAL {
+                                continue;
+                            }
+                            
+                            // 如果有版本要求，检查是否匹配
+                            if let Some(req_ver) = required_version {
+                                if let Some(sym_ver) = self.get_verdef_name(ver_idx) {
+                                    if sym_ver != req_ver {
+                                        continue; // 版本不匹配
+                                    }
+                                }
+                            }
+                        }
+                        
+                        return Some(self.load_bias + sym.st_value as usize);
+                    }
+                }
+            }
+        }
+        None
+    }
 
     fn reserve_address_space(&mut self) -> Result<(), String> {
         let mut min_vaddr = Elf_Addr::MAX;
@@ -1447,6 +1577,13 @@ impl ElfLoader {
         // Android packed
         let mut android_rela_off = 0;
         let mut android_rela_sz = 0;
+        
+        // Symbol versioning
+        let mut versym_off = 0;
+        let mut verdef_off = 0;
+        let mut verdef_num = 0;
+        let mut verneed_off = 0;
+        let mut verneed_num = 0;
 
         unsafe {
             let mut i = 0;
@@ -1538,6 +1675,14 @@ impl ElfLoader {
                             }
                         }
                     }
+                    
+                    // Symbol versioning
+                    DT_VERSYM => versym_off = dyn_entry.d_val as usize,
+                    DT_VERDEF => verdef_off = dyn_entry.d_val as usize,
+                    DT_VERDEFNUM => verdef_num = dyn_entry.d_val as usize,
+                    DT_VERNEED => verneed_off = dyn_entry.d_val as usize,
+                    DT_VERNEEDNUM => verneed_num = dyn_entry.d_val as usize,
+                    
                     _ => {}
                 }
                 i += 1;
@@ -1640,6 +1785,36 @@ impl ElfLoader {
                     }
                 }
             }
+        }
+        
+        // Symbol versioning
+        if versym_off != 0 {
+            let p = self.load_bias + versym_off;
+            if self.is_valid_ptr(p) {
+                self.versym = p as *const u16;
+            }
+        }
+        if verdef_off != 0 {
+            let p = self.load_bias + verdef_off;
+            if self.is_valid_ptr(p) {
+                self.verdef = p as *const u8;
+                self.verdef_num = verdef_num;
+            }
+        }
+        if verneed_off != 0 {
+            let p = self.load_bias + verneed_off;
+            if self.is_valid_ptr(p) {
+                self.verneed = p as *const u8;
+                self.verneed_num = verneed_num;
+            }
+        }
+        
+        // Log versioning info if present
+        if !self.versym.is_null() || !self.verdef.is_null() || !self.verneed.is_null() {
+            println!("[DYN] Symbol versioning: versym={} verdef={} verneed={}",
+                !self.versym.is_null(),
+                self.verdef_num,
+                self.verneed_num);
         }
 
         Ok(())

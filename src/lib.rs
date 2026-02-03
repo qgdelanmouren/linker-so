@@ -22,6 +22,7 @@ pub mod context;
 pub mod hooks;
 pub mod tls;
 pub mod unwind;
+pub mod crypto;
 
 mod embedded_libs {
     include!(concat!(env!("OUT_DIR"), "/embedded_libs.rs"));
