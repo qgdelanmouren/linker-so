@@ -1,6 +1,6 @@
 # Custom In-Memory Linker (Android)
 
-by Ai 100%
+
 
 This crate builds an Android `cdylib` that acts as a **custom in-memory ELF loader/linker**.
 
